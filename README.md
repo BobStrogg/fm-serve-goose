@@ -83,6 +83,11 @@ plain text, which Goose never ran. Causes, from Goose 1.56.0 source (`crates/goo
   same inside an argument all become `{"command": "ls"}`. This applies only to tools Goose offered, and only to a
   whole line or a whole `<tool_call>` body, never to a call mentioned inside a sentence
 
+- prunes tools when a request can't fit (proxy 2026-10-24.4). A Goose with many extensions (todo, memory, summon,
+  chat recall, …) sends about 4k tokens of tool schemas, which is fm's whole window. The proxy then keeps
+  shell/write/edit/tree (fewer if needed) and drops the other extensions' system-prompt sections. `FM_TOOLS=all` turns
+  this off; `FM_TOOLS=shell,edit` forces a list
+
 `./test_goose_session.sh` runs real Goose for two turns against `FM_MOCK_MODE=small`, which imitates these replies
 (`FM_MOCK_TOOLFMT=tagged|fenced|json|wrapped`).
 **Expect** the on-device model to still be weak: it picks the wrong command or path, misses tool calls, or answers

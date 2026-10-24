@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Runtime logs go to runs/ (gitignored) so a running stack never dirties the git checkout.
 LOG = os.environ.get("PROXY_LOG", os.path.join(HERE, "runs", "proxy.jsonl"))
 BAD_BODY = os.path.join(os.path.dirname(LOG), "last_upstream_400.json")
-PROXY_VERSION = "2026-10-24.3"   # reported by GET /proxy/version; setup restarts a stale proxy
+PROXY_VERSION = "2026-10-24.4"   # reported by GET /proxy/version; setup restarts a stale proxy
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "600"))
 
 MARKERS = re.compile(r"<start_of_turn>(?:model|assistant)?\s*|<end_of_turn>|<ctrl\d+>|<\|[a-z_]+\|>")
@@ -379,6 +379,45 @@ def _trim_text(s, keep):
     head = int(keep * 0.7); tail = keep - head
     return s[:head] + "\n…[%d characters trimmed by fm_tool_proxy]…\n" % (len(s) - keep) + s[-tail:]
 
+# Tool pruning: a Goose with many extensions (todo, memory, summon, ...) sends ~4k tokens of tool schemas alone, more than
+# fm's whole window. When the request doesn't fit, keep the most useful tools and drop the system-prompt sections of the
+# extensions whose tools went. FM_TOOLS=all disables this; FM_TOOLS=shell,edit forces a list.
+FM_TOOLS = os.environ.get("FM_TOOLS", "auto")
+_UNPREFIXED = {"developer": {"write", "edit", "shell", "tree", "read_image"}, "analyze": {"analyze"},
+               "summon": {"delegate", "load", "load_skill"}}
+_KEEP_STEPS = [("shell", "write", "edit", "tree"), ("shell", "edit"), ("shell",)]
+
+def _tool_ext(name):
+    if "__" in name: return name.split("__", 1)[0]
+    return next((e for e, ns in _UNPREFIXED.items() if name in ns), None)
+
+def _drop_sections(text, exts):
+    for e in exts:
+        text = re.sub(r"(?ms)^## %s\s*\n.*?(?=^#{1,2} |\Z)" % re.escape(e), "", text)
+    if "summon" in exts: text = re.sub(r"(?ms)^# Skills\s*\n.*?(?=^# |\Z)", "", text)
+    return text
+
+def prune_tools(req, budget):
+    """Returns a change note or None. Mutates req."""
+    tools = req.get("tools") or []
+    if not tools or FM_TOOLS == "all": return None
+    names = [t["function"]["name"] for t in tools]
+    if FM_TOOLS != "auto": steps = [tuple(x.strip() for x in FM_TOOLS.split(",") if x.strip())]
+    elif est_tokens(req) <= budget: return None
+    else: steps = _KEEP_STEPS
+    before = {_tool_ext(n) for n in names}
+    for keep in steps:
+        kept = [t for t in tools if t["function"]["name"] in keep]
+        if not kept: continue
+        trial = {**req, "tools": kept}
+        if FM_TOOLS != "auto" or est_tokens(trial) <= budget or keep == steps[-1]: break
+    gone = before - {_tool_ext(t["function"]["name"]) for t in kept} - {None}
+    req["tools"] = kept
+    for m in req.get("messages") or []:
+        if m.get("role") == "system" and isinstance(m.get("content"), str):
+            m["content"] = re.sub(r"\n{3,}", "\n\n", _drop_sections(m["content"], gone)).strip()
+    return "tools pruned to %s (dropped %d; extensions %s)" % (",".join(t["function"]["name"] for t in kept), len(names) - len(kept), ",".join(sorted(gone)) or "-")
+
 def prepare_context(req, cwd=None, budget=None):
     """Fix 9. Returns list of changes. Mutates req."""
     ch = []
@@ -414,6 +453,8 @@ def prepare_context(req, cwd=None, budget=None):
     ch.append("context line: cwd=%s" % ("turn-context" if facts.get("working-directory") else "peer" if cwd else "unknown"))
     # fit the window
     budget = budget or (CTX - RESERVE)
+    pn = prune_tools(req, budget)
+    if pn: ch.append(pn)
     if est_tokens(req) > budget:
         last_user = max([i for i, m in enumerate(msgs) if m.get("role") == "user"] or [0])
         sys_msgs = [m for m in msgs[:last_user] if m.get("role") == "system"]
@@ -819,6 +860,19 @@ if __name__ == "__main__":
         assert clean_reply('shell:run("ls")', T, "tool")[0] == []             # after a tool result: prose
         for n, a in [clean_reply(w, T)[0][0] for w in ['<tool_call id="shell:1">shell:run("ls")</tool_call>']]:
             assert "(" not in a["command"]
+        # many-extension Goose (todo/memory/summon/...): prune to the core tools and drop their prompt sections
+        big = [{"type": "function", "function": {"name": n, "description": "d" * 600, "parameters": {"type": "object", "properties": {"x": {"type": "string", "description": "y" * 300}}, "required": []}}}
+               for n in ["shell", "write", "edit", "tree", "read_image", "analyze", "delegate", "load", "load_skill", "todo__todo_write",
+                         "memory__remember_memory", "memory__retrieve_memories", "chatrecall__chatrecall", "extensionmanager__manage_extensions"]]
+        sysp = "Intro.\n\n# Skills\n\n- web-search: x\n\n# Extensions\n\n## developer\n\n### Instructions\nUse dev.\n\n## todo\n\n### Instructions\nTodo stuff.\n\n## memory\n\n### Instructions\nMemory stuff.\n"
+        rq = {"messages": [{"role": "system", "content": sysp}, {"role": "user", "content": "hi"}], "tools": big}
+        prepare_context(rq, cwd="/tmp", budget=3400)
+        kept = [t["function"]["name"] for t in rq["tools"]]
+        assert "shell" in kept and "todo__todo_write" not in kept and len(kept) <= 4, kept
+        sc = rq["messages"][0]["content"]
+        assert "## developer" in sc and "## todo" not in sc and "## memory" not in sc and "# Skills" not in sc, sc
+        rq2 = {"messages": [{"role": "user", "content": "hi"}], "tools": big[:2]}
+        assert prune_tools(rq2, 3400) is None and len(rq2["tools"]) == 2      # fits: untouched
         print("goose context + reply cleanup: ok")
         sys.exit(0)
     print(f"fm_tool_proxy on 127.0.0.1:{PORT} -> {UP} (n_ctx={CTX})", file=sys.stderr)
