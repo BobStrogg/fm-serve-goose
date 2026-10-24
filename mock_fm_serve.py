@@ -12,7 +12,10 @@ Modes (FM_MOCK_MODE):
   chat                  never emits tool-call text; plain answer only
   invent                with tools present, answers as if it had called them (hallucinated
                         result)  [SRC: spacecorps RESEARCH.md §2]
-Env: FM_MOCK_PORT (1976), FM_MOCK_CTX (4096), FM_MOCK_LOG (logs/mock_requests.jsonl)
+Strict decoding (FM_MOCK_STRICT=1, the default; 0 turns it off): rejects request shapes that
+real fm serve's Swift Codable decoder rejects, with its 400 "...: The data couldn't be read
+because it is missing." See validate().
+Env: FM_MOCK_PORT (1976), FM_MOCK_CTX (4096), FM_MOCK_LOG (runs/mock_requests.jsonl), FM_MOCK_STRICT (1)
 """
 import json, os, sys, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,7 +23,72 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(os.environ.get("FM_MOCK_PORT", "1976"))
 CTX = int(os.environ.get("FM_MOCK_CTX", "4096"))
 MODE = os.environ.get("FM_MOCK_MODE", "regression")
-LOG = os.environ.get("FM_MOCK_LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "mock_requests.jsonl"))
+LOG = os.environ.get("FM_MOCK_LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", "mock_requests.jsonl"))
+STRICT = os.environ.get("FM_MOCK_STRICT", "1") != "0"
+MISSING = "The data couldn\u2019t be read because it is missing."
+BADFMT = "The data couldn\u2019t be read because it isn\u2019t in the correct format."
+
+def _schema_err(s, path):
+    """First problem in a tool property schema, as (path, reason), or None.
+    [SRC fm-proxy AGENTS.md / fm-proxy.js header, 27.0 RC]: $ref/$defs and anyOf/allOf/oneOf/
+    if/then/else/not/patternProperties are not understood; `type` arrays are rejected; a titled
+    string needs a non-empty enum; the root `required` must be present.
+    [SRC future-architect 2026-06-24]: objects with properties need `required`.
+    [ASM, Swift Codable]: a property schema without `type` is keyNotFound("type")."""
+    if not isinstance(s, dict): return path, "schema is not an object"
+    for k in ("$ref", "$defs", "definitions", "anyOf", "oneOf", "allOf", "if", "then", "else", "not", "patternProperties"):
+        if k in s: return path, f"unsupported key {k}"
+    t = s.get("type")
+    if t is None: return path, "missing type"
+    if not isinstance(t, str): return path, "type must be a string"
+    if t == "string" and s.get("title") and not s.get("enum"): return path, "titled string without enum"
+    if t == "object":
+        if not isinstance(s.get("properties"), dict): return path, "object without properties"
+        if s["properties"] and not isinstance(s.get("required"), list): return path, "object without required"
+        for k, v in s["properties"].items():
+            e = _schema_err(v, f"{path}.properties.{k}")
+            if e: return e
+    if t == "array":
+        if not isinstance(s.get("items"), dict): return path, "array without items"
+        return _schema_err(s["items"], path + ".items")
+    return None
+
+def validate(req):
+    """None if fm serve would decode `req`, else (status, message, field)."""
+    msgs = req.get("messages")
+    if not isinstance(msgs, list) or not msgs: return 400, "Invalid request: " + MISSING, "messages"
+    ids = set()
+    for i, m in enumerate(msgs):
+        role = m.get("role") if isinstance(m, dict) else None
+        if role == "developer": return 400, "Invalid JSON: " + BADFMT, f"messages[{i}].role"   # [SRC fm-proxy.js]
+        if role not in ("system", "user", "assistant", "tool"): return 400, "Invalid request: " + BADFMT, f"messages[{i}].role"
+        c = m.get("content")
+        if role != "assistant" and c is None: return 400, "Invalid request: " + MISSING, f"messages[{i}].content"   # [ASM]
+        if isinstance(c, list):
+            for j, part in enumerate(c):
+                if not isinstance(part, dict) or part.get("type") not in ("text", "image_url"):
+                    return 400, "Invalid request: " + BADFMT, f"messages[{i}].content[{j}]"   # [ASM]
+                if part["type"] == "text" and not isinstance(part.get("text"), str):
+                    return 400, "Invalid request: " + MISSING, f"messages[{i}].content[{j}].text"
+        for j, t in enumerate(m.get("tool_calls") or []):
+            fn = t.get("function") or {}
+            if not t.get("id") or not isinstance(fn.get("name"), str) or not isinstance(fn.get("arguments"), str):
+                return 400, "Invalid request: " + MISSING, f"messages[{i}].tool_calls[{j}]"   # [ASM]
+            ids.add(t["id"])
+        if role == "tool":
+            tid = m.get("tool_call_id")
+            if not tid: return 400, "Invalid request: " + MISSING, f"messages[{i}].tool_call_id"
+            if tid not in ids: return 400, f"tool message references unknown tool_call_id: '{tid}'", f"messages[{i}].tool_call_id"  # [SRC]
+    for i, t in enumerate(req.get("tools") or []):
+        fn = t.get("function") if isinstance(t, dict) else None
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str): return 400, "Invalid tool definition: " + MISSING, f"tools[{i}].function.name"
+        if not isinstance(fn.get("description"), str): return 400, "Invalid JSON: " + MISSING, f"tools[{i}].function.description"  # [SRC]
+        ps = fn.get("parameters")
+        if not isinstance(ps, dict) or ps.get("type") != "object" or not isinstance(ps.get("required"), list):
+            return 400, "Invalid request: " + MISSING, f"tools[{fn['name']}].parameters"   # [SRC root required]
+        e = _schema_err(ps, f"tools[{fn['name']}].parameters")
+        if e: return 400, "Invalid request: " + MISSING, f"{e[0]} ({e[1]})"
+    return None
 
 try:
     import tiktoken
@@ -117,7 +185,12 @@ class H(BaseHTTPRequestHandler):
             return self._err(400, "stop is not supported")  # [SRC: 400] [ASM: message text]
         for t in req.get("tools") or []:
             if "description" not in t.get("function", {}):
-                return self._err(400, "Invalid tool definition: missing description")  # [SRC: 400] [ASM: text]
+                return self._err(400, "Invalid JSON: " + MISSING)  # [SRC: fm-proxy AGENTS.md]
+        bad = validate(req) if STRICT else None
+        if bad:
+            print(f"[mock] 400 at {bad[2]}: {bad[1]}", file=sys.stderr, flush=True)
+            with open(LOG, "a") as f: f.write(json.dumps({"ts": time.time(), "rejected": bad[2], "message": bad[1]}) + "\n")
+            return self._err(bad[0], bad[1])
         tc = req.get("tool_choice")
         if tc == "required" or isinstance(tc, dict):
             return self._err(500, "An unsupported generation guide was used.")  # [SRC]
@@ -164,5 +237,5 @@ class H(BaseHTTPRequestHandler):
         self.close_connection = True
 
 if __name__ == "__main__":
-    print(f"mock fm serve on 127.0.0.1:{PORT} mode={MODE} ctx={CTX} tokenizer={TOKENIZER}", file=sys.stderr)
+    print(f"mock fm serve on 127.0.0.1:{PORT} mode={MODE} ctx={CTX} strict={STRICT} tokenizer={TOKENIZER}", file=sys.stderr)
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()

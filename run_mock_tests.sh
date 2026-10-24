@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Reproduce the Linux mock tests. Starts mock fm serve (:1976, regression mode) + proxy (:1977),
 # runs Goose scenarios, prints request-size table. Usage: ./run_mock_tests.sh
+# (Strict request validation is off here to keep these size measurements comparable;
+#  ./test_goose_smoke.sh is the strict regression test.)
 set -u
 cd "$(dirname "$0")"; D=$PWD; PY=${PY:-$D/.venv/bin/python}; [ -x "$PY" ] || PY=python3
 pkill -f mock_fm_serve.py 2>/dev/null; pkill -f fm_tool_proxy.py 2>/dev/null; sleep 0.5
 mkdir -p logs runs/empty; rm -rf logs/bodies
-FM_MOCK_MODE=regression $PY mock_fm_serve.py > logs/mock.out 2>&1 &
-python3 fm_tool_proxy.py > logs/proxy.out 2>&1 &
+FM_MOCK_MODE=regression FM_MOCK_STRICT=0 FM_MOCK_LOG=logs/mock_requests.jsonl $PY mock_fm_serve.py > logs/mock.out 2>&1 &
+PROXY_LOG=logs/proxy.jsonl python3 fm_tool_proxy.py > logs/proxy.out 2>&1 &
 sleep 1
 export HOME=$D/home GOOSE_DISABLE_KEYRING=1 GOOSE_PROVIDER=openai GOOSE_MODEL=system \
        OPENAI_BASE_PATH=v1/chat/completions OPENAI_API_KEY=sk-local

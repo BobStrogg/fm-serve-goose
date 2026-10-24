@@ -42,6 +42,23 @@ Other findings from the source and the runs:
 - `load_skill` is always injected (SkillOperation) and costs ~170 tokens. I found no config switch that removes it.
 - Goose streams (`stream:true` with `stream_options.include_usage`).
 
+### 2a. Fixed: `400 Invalid request: The data couldn't be read because it is missing.` [TESTED-MOCK + real Mac report]
+The first real Mac run (macOS 27, fm 2.0.68) failed the README smoke test with that 400 on Goose's first
+request that carries tools. Cause: `--with-builtin developer` includes Goose's `read_image` tool, whose
+parameters use a JSON Schema reference: `"crop": {"$ref": "#/$defs/CropParams", "default": null}`. fm serve
+decodes tool schemas with strict Swift `Codable` types, doesn't understand `$ref`/`$defs` [SRC fm-proxy], and a
+property with no `type` is a missing key, which is exactly Swift's "data couldn't be read because it is missing".
+The lean `config.example.yaml` (shell + load_skill) never sends `read_image`, so it wasn't affected.
+
+`fm_tool_proxy.py` now normalises every request (`normalize_request`): `$ref`/`$defs` inlined, anyOf/oneOf/allOf
+and `type` arrays collapsed, every property gets a `type`, every object gets `properties` and `required`,
+decorative and validation keys (`title`, `default`, `$schema`, `format`, `minimum`, `strict`) dropped,
+`developer` mapped to `system`, null or array `content` turned into a string, and `stop` applied by the proxy.
+On any 4xx from fm serve it logs a field summary to `runs/proxy.jsonl` and saves the exact forwarded body to
+`runs/last_upstream_400.json`. The mock is now strict (`FM_MOCK_STRICT=1`, default) and `./test_goose_smoke.sh`
+checks both halves: Goose straight to the mock reproduces the 400, and Goose through the proxy prints hello.
+`GET :1977/proxy/version` reports the running proxy's version.
+
 ## 3. The tool-calling regression [SRC]
 - In fm 2.0.68.x (Beta 5 onward, and in the RC), `tool_choice:"auto"` **never fills `tool_calls`**, and `finish_reason` is `stop`. Spacecorps saw 0 of 54. When the model does call a tool, the call text leaks into `content`, for example
   `<start_of_turn>model\n{"tool_call": [{"name": "get_weather", "arguments": {"city": "Tokyo"}}]}`. Spacecorps saw this in 13 of 45 replies, and fm-proxy reported markers in 7–9 of 10. Other replies **invent the tool result instead**. Forced `tool_choice` returns 500 "An unsupported generation guide was used." Tool calling reportedly worked in 2.0.62.
@@ -72,9 +89,9 @@ fm-proxy measured 4096 on the RC (4045 tokens pass, ~4255 overflow). apfel repor
 - Set `GOOSE_CONTEXT_LIMIT`, because Goose otherwise defaults to 128k.
 
 ## 6. Run
-- Mock (Linux): `./run_mock_tests.sh`
-- Mac: `sudo fm license` once, then `./start_mac.sh`, then the env from §1.
-- Files: `mock_fm_serve.py`, `fm_tool_proxy.py` (`--selftest` runs the parser tests), `fm_sdk_server.py`, `config.example.yaml`, `start_mac.sh`, `run_mock_tests.sh`, `logs/` (request logs and bodies), `bin/goose`.
+- Mock (Linux or Mac): `./run_mock_tests.sh` (size table), `./test_goose_smoke.sh` (strict regression test), `python3 fm_tool_proxy.py --selftest`
+- Mac: `sudo fm license` once, then `./start_mac.sh`, then the env from §1. Runtime logs (`proxy.jsonl`, `last_upstream_400.json`, `stack.out`) go to `runs/`, which git ignores.
+- Files: `mock_fm_serve.py`, `fm_tool_proxy.py` (`--selftest` runs the parser tests), `fm_sdk_server.py`, `config.example.yaml`, `start_mac.sh`, `run_mock_tests.sh`, `test_goose_smoke.sh`, `logs/` (request logs and bodies from the original mock runs), `bin/goose`.
 
 ## Sources
 - fm-proxy README + AGENTS.md (live audit, 27.0 RC, fm 2.0.68.1.402): https://github.com/gregbarbosa/fm-proxy · https://raw.githubusercontent.com/gregbarbosa/fm-proxy/main/AGENTS.md · fm CLI help: https://raw.githubusercontent.com/gregbarbosa/fm-proxy/main/docs/fm-reference.md
