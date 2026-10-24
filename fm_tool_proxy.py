@@ -51,6 +51,9 @@ DEC = json.JSONDecoder()
 
 def log(**kw):
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    try:   # keep an always-on stack's log bounded: one 5 MB generation + the current file
+        if os.path.getsize(LOG) > 5_000_000: os.replace(LOG, LOG + ".1")
+    except OSError: pass
     with open(LOG, "a") as f: f.write(json.dumps({"ts": time.time(), **kw}) + "\n")
 
 def _norm_call(obj, names):
