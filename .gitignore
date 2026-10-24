@@ -1,0 +1,6 @@
+bin/
+.venv/
+home/
+runs/
+__pycache__/
+*.pyc

@@ -1,0 +1,66 @@
+
+### A  direct :1976, default extensions
+   \____)    20261023_18 · /workspace/fm-goose/runs/empty
+     L L     goose is ready
+error: Ran into this error: Server error: Server error (500 Internal Server Error) at http://127.0.0.1:1976/v1/chat/completions: The session's transcript exceeded the model's context size..
+Please retry if you think this is a transient or recoverable error.
+Error: Ran into this error: Server error: Server error (500 Internal Server Error) at http://127.0.0.1:1976/v1/chat/completions: The session's transcript exceeded the model's context size..
+Please retry if you think this is a transient or recoverable error.
+   req: est_tokens=  441 system= 322 tools=   0 (x0) msgs=61
+   req: est_tokens= 4282 system= 850 tools=3321 (x17) msgs=53
+   req: est_tokens= 4282 system= 850 tools=3321 (x17) msgs=53
+   req: est_tokens= 4282 system= 850 tools=3321 (x17) msgs=53
+   req: est_tokens= 4282 system= 850 tools=3321 (x17) msgs=53
+
+### B  direct :1976, --no-profile --with-builtin developer (regression visible)
+    __( O)>  ● new session · openai system
+   \____)    20261023_19 · /workspace/fm-goose/runs/empty
+     L L     goose is ready
+<start_of_turn>model
+{"tool_call": [{"name": "shell", "arguments": {"command": "echo hello-from-fm && ls | head -3"}}]}<ctrl46>
+   req: est_tokens=  446 system= 322 tools=   0 (x0) msgs=66
+   req: est_tokens= 1769 system= 562 tools=1091 (x6) msgs=58
+
+### C  proxy :1977, --no-profile --with-builtin developer (workaround)
+     L L     goose is ready
+  ────────────────────────────────────────
+  ▸ shell
+    command: echo hello-from-fm && ls | head -3
+hello-from-fmThe tool returned: hello-from-fm
+Done.
+   req: est_tokens=  446 system= 322 tools=   0 (x0) msgs=66
+   req: est_tokens= 1719 system= 562 tools=1091 (x6) msgs=8
+   req: est_tokens= 1789 system= 562 tools=1091 (x6) msgs=70
+
+### D  proxy :1977, default extensions, GOOSE_CONTEXT_LIMIT=4096
+· Exceeded auto-compact threshold of 3k tokens. Performing auto-compaction...
+· Compaction complete
+error: Context length exceeded: context length exceeded (4096-token window): The session's transcript exceeded the model's context size.
+The conversation is too long for the model's context window.
+Error: Context length exceeded: context length exceeded (4096-token window): The session's transcript exceeded the model's context size.
+The conversation is too long for the model's context window.
+   req: est_tokens=  441 system= 322 tools=   0 (x0) msgs=61
+   req: est_tokens= 4233 system= 851 tools=3321 (x17) msgs=3
+   req: est_tokens=  692 system= 623 tools=   0 (x0) msgs=11
+   req: est_tokens= 4305 system= 851 tools=3321 (x17) msgs=67
+   req: est_tokens=  761 system= 692 tools=   0 (x0) msgs=11
+   req: est_tokens= 4305 system= 851 tools=3321 (x17) msgs=67
+
+### E  config.example.yaml only (lean: developer/shell), no API key
+     L L     goose is ready
+  ────────────────────────────────────────
+  ▸ shell
+    command: echo hello-from-fm && ls | head -3
+hello-from-fmThe tool returned: hello-from-fm
+Done.
+   req: est_tokens=  446 system= 322 tools=   0 (x0) msgs=66
+   req: est_tokens= 1008 system= 562 tools= 380 (x2) msgs=8
+   req: est_tokens= 1081 system= 562 tools= 380 (x2) msgs=73
+
+### F  config.example.yaml + GOOSE_TOOLSHIM=true (no tools array sent)
+    __( O)>  ● new session · openai system
+   \____)    20261023_23 · /workspace/fm-goose/runs/empty
+     L L     goose is ready
+PONG from mock fm serve. You said: Run a shell command that prints hello
+   req: est_tokens=  446 system= 322 tools=   0 (x0) msgs=66
+   req: est_tokens= 1051 system= 985 tools=   0 (x0) msgs=8

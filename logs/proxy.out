@@ -1,0 +1,12 @@
+fm_tool_proxy on 127.0.0.1:1977 -> http://127.0.0.1:1976 (n_ctx=4096)
+[proxy] tools=0 parsed=[] usage={'prompt_tokens': 446, 'completion_tokens': 28, 'total_tokens': 474}
+[proxy] tools=6 parsed=[('shell', {'command': 'echo hello-from-fm && ls | head -3'})] usage={'prompt_tokens': 1719, 'completion_tokens': 41, 'total_tokens': 1760}
+[proxy] tools=6 parsed=[] usage={'prompt_tokens': 1789, 'completion_tokens': 11, 'total_tokens': 1800}
+[proxy] tools=0 parsed=[] usage={'prompt_tokens': 441, 'completion_tokens': 28, 'total_tokens': 469}
+[proxy] tools=0 parsed=[] usage={'prompt_tokens': 692, 'completion_tokens': 21, 'total_tokens': 713}
+[proxy] tools=0 parsed=[] usage={'prompt_tokens': 761, 'completion_tokens': 21, 'total_tokens': 782}
+[proxy] tools=0 parsed=[] usage={'prompt_tokens': 446, 'completion_tokens': 28, 'total_tokens': 474}
+[proxy] tools=2 parsed=[('shell', {'command': 'echo hello-from-fm && ls | head -3'})] usage={'prompt_tokens': 1008, 'completion_tokens': 41, 'total_tokens': 1049}
+[proxy] tools=2 parsed=[] usage={'prompt_tokens': 1081, 'completion_tokens': 11, 'total_tokens': 1092}
+[proxy] tools=0 parsed=[] usage={'prompt_tokens': 446, 'completion_tokens': 28, 'total_tokens': 474}
+[proxy] tools=0 parsed=[] usage={'prompt_tokens': 1051, 'completion_tokens': 17, 'total_tokens': 1068}

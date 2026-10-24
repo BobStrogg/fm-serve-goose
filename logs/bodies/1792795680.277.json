@@ -1,0 +1,17 @@
+{
+ "model": "system",
+ "messages": [
+  {
+   "role": "system",
+   "content": "Generate a short title (four words or less) for this conversation.\n\nTitle what the work is ABOUT, not the mechanical activity. Many conversations share the same workflow steps (creating a PR, setting up a worktree, drafting an email, summarizing a document); a good title carries the distinguishing subject instead \u2014 a ticket or issue ID, feature name, customer or company, person, document, event, or project.\n\nRules:\n- If a ticket or issue identifier (like ABC-123) appears in the messages, include it in the title. Use identifiers found only in hints when the messages make their relevance clear.\n- Prefer names of companies, projects, or documents over generic activity words.\n- Prefer a company or project name over a person's name when both are present.\n- If there is genuinely no distinguishing subject, a plain activity title is fine \u2014 never invent specifics that are not present.\n\nReply with only the title, nothing else. Do not show your reasoning.\n\nExamples:\n- \"how do I reverse a list in python?\" \u2192 Python list reversal\n- \"set up a git worktree for BOT-1565 session auto titles\" \u2192 BOT-1565 session auto-titles\n- \"open the payments repo and create a PR for the refund timeout fix\" \u2192 Refund timeout fix\n- \"help me draft a follow-up email about the renewal\" (hints mention Acme) \u2192 Acme renewal follow-up\n- \"summarize this spreadsheet\" (attached \"Q3 pipeline.xlsx\") \u2192 Q3 pipeline summary\n- \"what's the weather in Tokyo?\" \u2192 Tokyo weather"
+  },
+  {
+   "role": "user",
+   "content": "---BEGIN HINTS (optional signals like the working folder; use them only when they match the subject of the messages)---\nworking folder: empty\n---END HINTS---\n\n---BEGIN USER MESSAGES---\nRun a shell command that prints hello\n---END USER MESSAGES---\n\nGenerate a short title for the above messages."
+  }
+ ],
+ "stream": true,
+ "stream_options": {
+  "include_usage": true
+ }
+}

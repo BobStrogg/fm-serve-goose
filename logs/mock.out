@@ -1,0 +1,22 @@
+mock fm serve on 127.0.0.1:1976 mode=regression ctx=4096 tokenizer=tiktoken/cl100k_base
+[mock] 441 est tok (sys 322, tools 0 x0, msgs 61) stream=True
+[mock] 4282 est tok (sys 850, tools 3321 x17, msgs 53) stream=True
+[mock] 4282 est tok (sys 850, tools 3321 x17, msgs 53) stream=True
+[mock] 4282 est tok (sys 850, tools 3321 x17, msgs 53) stream=True
+[mock] 4282 est tok (sys 850, tools 3321 x17, msgs 53) stream=True
+[mock] 446 est tok (sys 322, tools 0 x0, msgs 66) stream=True
+[mock] 1769 est tok (sys 562, tools 1091 x6, msgs 58) stream=True
+[mock] 446 est tok (sys 322, tools 0 x0, msgs 66) stream=False
+[mock] 1719 est tok (sys 562, tools 1091 x6, msgs 8) stream=False
+[mock] 1789 est tok (sys 562, tools 1091 x6, msgs 70) stream=False
+[mock] 441 est tok (sys 322, tools 0 x0, msgs 61) stream=False
+[mock] 4233 est tok (sys 851, tools 3321 x17, msgs 3) stream=False
+[mock] 692 est tok (sys 623, tools 0 x0, msgs 11) stream=False
+[mock] 4305 est tok (sys 851, tools 3321 x17, msgs 67) stream=False
+[mock] 761 est tok (sys 692, tools 0 x0, msgs 11) stream=False
+[mock] 4305 est tok (sys 851, tools 3321 x17, msgs 67) stream=False
+[mock] 446 est tok (sys 322, tools 0 x0, msgs 66) stream=False
+[mock] 1008 est tok (sys 562, tools 380 x2, msgs 8) stream=False
+[mock] 1081 est tok (sys 562, tools 380 x2, msgs 73) stream=False
+[mock] 446 est tok (sys 322, tools 0 x0, msgs 66) stream=False
+[mock] 1051 est tok (sys 985, tools 0 x0, msgs 8) stream=False

@@ -1,0 +1,94 @@
+# Goose config for Apple fm serve (via fm_tool_proxy on :1977). Copy to ~/.config/goose/config.yaml
+GOOSE_PROVIDER: openai
+GOOSE_MODEL: system            # the only model id fm serve accepts
+OPENAI_HOST: http://127.0.0.1:1977   # proxy; use :1976 to hit fm serve directly (chat-only)
+OPENAI_BASE_PATH: v1/chat/completions
+GOOSE_CONTEXT_LIMIT: 4096      # or 8192 if `fm`/SDK reports that on your Mac
+GOOSE_AUTO_COMPACT_THRESHOLD: 0.8
+GOOSE_MODE: auto
+extensions:
+  developer:
+    enabled: true
+    type: platform
+    name: developer
+    display_name: Developer
+    description: ''
+    bundled: true
+    available_tools: [shell]   # only the shell tool -> smallest prompt
+  analyze:
+    enabled: false
+    type: platform
+    name: analyze
+    display_name: Analyze
+    description: ''
+    bundled: true
+  apps:
+    enabled: false
+    type: platform
+    name: apps
+    display_name: Apps
+    description: ''
+    bundled: true
+  extensionmanager:
+    enabled: false
+    type: platform
+    name: Extension Manager
+    display_name: Extension Manager
+    description: ''
+    bundled: true
+  scheduler:
+    enabled: false
+    type: platform
+    name: scheduler
+    display_name: Scheduler
+    description: ''
+    bundled: true
+  summon:
+    enabled: false
+    type: platform
+    name: summon
+    display_name: Summon
+    description: ''
+    bundled: true
+  tom:
+    enabled: false
+    type: platform
+    name: tom
+    display_name: Top Of Mind
+    description: ''
+    bundled: true
+  skills:
+    enabled: false
+    type: platform
+    name: skills
+    display_name: Skills
+    description: ''
+    bundled: true
+  todo:
+    enabled: false
+    type: platform
+    name: todo
+    display_name: Todo
+    description: ''
+    bundled: true
+  chatrecall:
+    enabled: false
+    type: platform
+    name: chatrecall
+    display_name: Chat Recall
+    description: ''
+    bundled: true
+  summarize:
+    enabled: false
+    type: platform
+    name: summarize
+    display_name: Summarize
+    description: ''
+    bundled: true
+  code_execution:
+    enabled: false
+    type: platform
+    name: code_execution
+    display_name: Code Mode
+    description: ''
+    bundled: true
