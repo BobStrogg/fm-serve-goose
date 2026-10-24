@@ -12,17 +12,25 @@ Modes (FM_MOCK_MODE):
   chat                  never emits tool-call text; plain answer only
   invent                with tools present, answers as if it had called them (hallucinated
                         result)  [SRC: spacecorps RESEARCH.md §2]
+  small                 what real fm serve + Goose 1.56 produced on a Mac (2026-10-23):
+                        wraps replies in an echoed <turn_context>; with no working directory in
+                        the prompt it asks which directory; otherwise it writes the call as TEXT
+                        (FM_MOCK_TOOLFMT: tagged = <tool_call id="shell:1">cmd + invented
+                        <stdout>, fenced = ```bash block, json = leaked {"tool_call":..};
+                        default rotates) and never sets tool_calls.
 Strict decoding (FM_MOCK_STRICT=1, the default; 0 turns it off): rejects request shapes that
 real fm serve's Swift Codable decoder rejects, with its 400 "...: The data couldn't be read
 because it is missing." See validate().
 Env: FM_MOCK_PORT (1976), FM_MOCK_CTX (4096), FM_MOCK_LOG (runs/mock_requests.jsonl), FM_MOCK_STRICT (1)
 """
-import json, os, sys, time, uuid
+import json, os, re, sys, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("FM_MOCK_PORT", "1976"))
 CTX = int(os.environ.get("FM_MOCK_CTX", "4096"))
 MODE = os.environ.get("FM_MOCK_MODE", "regression")
+TOOLFMT = os.environ.get("FM_MOCK_TOOLFMT", "rotate")
+_n_small = [0]
 LOG = os.environ.get("FM_MOCK_LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", "mock_requests.jsonl"))
 STRICT = os.environ.get("FM_MOCK_STRICT", "1") != "0"
 MISSING = "The data couldn\u2019t be read because it is missing."
@@ -132,6 +140,28 @@ def pick_tool_call(tools, user_text):
     req = (f.get("parameters") or {}).get("required", [])
     return f["name"], {k: "x" for k in req}
 
+def small_model_reply(msgs, tools, last, user_text):
+    """[observed on a Mac, 2026-10-23] Echoes Goose's turn-context tag; text-form tool calls."""
+    every = "\n".join(text_of(m.get("content")) for m in msgs)
+    knows_cwd = "Working directory:" in every or "<working-directory>" in every
+    names = [t.get("function", {}).get("name") for t in tools]
+    q = re.search(r'"([^"]+)"', user_text)
+    if not tools or "shell" not in names:
+        return "<turn_context>\nPONG from mock fm serve. You said: " + user_text[:80] + "\n</turn_context>"
+    if not knows_cwd and not q:
+        return ("<turn_context>\nThe current operational context indicates no explicit reference to a specific directory. "
+                "Could you please clarify which directory you'd like me to list?\n</turn_context>")
+    cmd = ("ls " + json.dumps(q.group(1))) if q else "ls"
+    fmts = ["tagged", "fenced", "json"]
+    fmt = TOOLFMT if TOOLFMT in fmts else fmts[_n_small[0] % 3]
+    _n_small[0] += 1
+    if fmt == "tagged":
+        return ("<turn_context>\nLet me check.\n</turn_context>\n<tool_call id=\"shell:1\">\n" + cmd +
+                "\n\n<stdout>\n['run.sh', 'README.md']\n</stdout>\nThe directory contains run.sh and README.md.")
+    if fmt == "fenced":
+        return "I'll list the files.\n```bash\n" + cmd + "\n```"
+    return "<start_of_turn>model\n" + json.dumps({"tool_call": [{"name": "shell", "arguments": {"command": cmd}}]}) + "<ctrl46>"
+
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def log_message(self, *a): pass
@@ -201,8 +231,12 @@ class H(BaseHTTPRequestHandler):
         last = msgs[-1] if msgs else {}
         tools = req.get("tools") or []
         user_text = text_of(last.get("content"))
-        if last.get("role") == "tool":
+        if last.get("role") == "tool" and MODE == "small":
+            content = "<turn_context>\nThe directory contains:\n" + text_of(last.get("content"))[:400].strip() + "\n</turn_context>"
+        elif last.get("role") == "tool":
             content = "The tool returned: " + text_of(last.get("content"))[:200].strip() + "\nDone."
+        elif MODE == "small":
+            content = small_model_reply(msgs, tools, last, user_text)
         elif tools and MODE == "regression":
             name, args = pick_tool_call(tools, user_text)
             # [SRC] shape seen live: <start_of_turn>model\n{"tool_call": [{"name": ..., "arguments": {...}}]}

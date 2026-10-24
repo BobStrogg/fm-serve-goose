@@ -31,9 +31,24 @@ Fixes (stdlib only, Python 3.9+):
     arguments -> JSON strings; `stop`, `reasoning_effort`, `strict` are not forwarded.
  8. Any upstream 4xx is logged with a field summary, and the exact forwarded body is
     saved to runs/last_upstream_400.json, so the next failure says which field it was.
+ 9. Goose context (prepare_context): Goose 1.56 only sends its `<turn-context>` block (cwd, time)
+    when the context limit is >= 32k, but its system prompt always describes that block. At
+    4096 the model never learns the working directory and echoes `<turn_context>` back. The
+    proxy removes that section and Goose boilerplate from the system prompt, moves any real
+    `<turn-context>` facts into one plain system line, and otherwise reads the working directory
+    of the Goose process on the other end of the loopback connection (lsof on macOS, /proc on
+    Linux; skipped for `goose acp`, whose sessions have their own cwd). Disable: FM_PEER_CWD=0.
+    It then drops the oldest turns (never the latest user turn or what follows it) and trims
+    long tool output so the request fits FM_CTX, and retries once, tighter, on overflow.
+10. Reply cleanup (clean_reply): strips echoed `<turn_context>`/`<turn-context>` wrappers and
+    their time/cwd lines, drops invented `<stdout>`/`<output>` sections, and turns text-form calls
+    (`<tool_call id="shell:1">cmd`, JSON blobs, a lone ```bash block when `shell` is offered and
+    the user spoke last) into real `tool_calls`. Text the model wrote after a call (a guessed
+    result) is dropped. Plain prose is never turned into a call.
 Env: PROXY_PORT=1977 FM_UPSTREAM=http://127.0.0.1:1976 FM_CTX=4096 PROXY_LOG=runs/proxy.jsonl
+     FM_RESERVE=600 (tokens kept free for the reply) FM_PEER_CWD=1
 """
-import json, os, re, sys, time, uuid, urllib.request, urllib.error
+import json, os, re, subprocess, sys, time, uuid, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PROXY_PORT", "1977"))
@@ -43,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Runtime logs go to runs/ (gitignored) so a running stack never dirties the git checkout.
 LOG = os.environ.get("PROXY_LOG", os.path.join(HERE, "runs", "proxy.jsonl"))
 BAD_BODY = os.path.join(os.path.dirname(LOG), "last_upstream_400.json")
-PROXY_VERSION = "2026-10-24.1"   # reported by GET /proxy/version; setup restarts a stale proxy
+PROXY_VERSION = "2026-10-24.2"   # reported by GET /proxy/version; setup restarts a stale proxy
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "600"))
 
 MARKERS = re.compile(r"<start_of_turn>(?:model|assistant)?\s*|<end_of_turn>|<ctrl\d+>|<\|[a-z_]+\|>")
@@ -291,6 +306,195 @@ def describe_body(req):
             "tools": {(t.get("function") or {}).get("name"): sorted(((t.get("function") or {}).get("parameters") or {}).get("properties", {}))
                       for t in req.get("tools") or [] if isinstance(t, dict)}}
 
+# ---- Goose context (fix 9) ---------------------------------------------------------
+RESERVE = int(os.environ.get("FM_RESERVE", "600"))
+PEER_CWD = os.environ.get("FM_PEER_CWD", "1") != "0"
+TC_BLOCK = re.compile(r"<turn[-_]context>(.*?)</turn[-_]context>", re.S)
+_BOILER = [
+    re.compile(r"\n?# Turn Context\n.*?(?=\n# |\Z)", re.S),
+    re.compile(r"goose is being developed as an open-source software project\.\n?"),
+    re.compile(r"Extensions provide additional tools and context from different data sources and applications\.\n"
+               r"You can dynamically enable or disable extensions as needed to help complete tasks\.\n?"),
+    re.compile(r"Because you dynamically load extensions, your conversation history may refer\s+to interactions with "
+               r"extensions that are not currently active\. The currently\s+active extensions are below\. Each of these "
+               r"extensions provides tools that are\s+in your tool specification\.\n?"),
+    re.compile(r"Make sure to use the tools \*efficiently\*.*?cost the user money\.\n?", re.S),
+]
+
+def _tag(name, text):
+    m = re.search(r"<%s>(.*?)</%s>" % (name, name), text, re.S)
+    return m.group(1).strip() if m else None
+
+_peer_cache = {}
+def peer_cwd(port):
+    """Working directory of the local Goose process that owns the client end of this connection."""
+    if not PEER_CWD or not port: return None
+    if port in _peer_cache: return _peer_cache[port]
+    cwd = None
+    try:
+        me = os.getpid()
+        if sys.platform == "darwin":
+            r = subprocess.run(["/usr/sbin/lsof", "-nP", "-t", "-iTCP:%d" % port, "-sTCP:ESTABLISHED"],
+                               capture_output=True, text=True, timeout=3)
+            for pid in [int(x) for x in r.stdout.split() if x.isdigit() and int(x) != me]:
+                args = subprocess.run(["/bin/ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=3).stdout
+                if "goose" not in args.split(" ")[0] or re.search(r"\sacp(\s|$)", args): continue
+                r2 = subprocess.run(["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=3)
+                cwd = next((l[1:] for l in r2.stdout.splitlines() if l.startswith("n")), None)
+                if cwd: break
+        elif os.path.isdir("/proc"):
+            inode = None
+            for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+                try:
+                    for line in open(f).read().splitlines()[1:]:
+                        c = line.split()
+                        if int(c[1].rsplit(":", 1)[1], 16) == port and c[3] == "01": inode = c[9]; break
+                except OSError: pass
+                if inode: break
+            if inode:
+                tgt = "socket:[%s]" % inode
+                for pid in filter(str.isdigit, os.listdir("/proc")):
+                    if int(pid) == me: continue
+                    try:
+                        if not any(os.readlink("/proc/%s/fd/%s" % (pid, fd)) == tgt for fd in os.listdir("/proc/%s/fd" % pid)): continue
+                        argv = open("/proc/%s/cmdline" % pid, "rb").read().split(b"\0")
+                        if b"goose" not in os.path.basename(argv[0]) or b"acp" in argv[1:3]: break
+                        cwd = os.readlink("/proc/%s/cwd" % pid); break
+                    except OSError: continue
+    except Exception: cwd = None
+    if len(_peer_cache) > 256: _peer_cache.clear()
+    _peer_cache[port] = cwd
+    return cwd
+
+def est_tokens(req):
+    """Conservative token estimate for fm's tokenizer (no exact count without forking `fm`)."""
+    n = 60
+    for m in req.get("messages") or []:
+        n += 6 + len(_text_of(m.get("content"))) / 3.2 + len(json.dumps(m.get("tool_calls") or "")) / 2.8
+    if req.get("tools"): n += len(json.dumps(req["tools"])) / 2.8
+    return int(n)
+
+def _trim_text(s, keep):
+    if len(s) <= keep: return s
+    head = int(keep * 0.7); tail = keep - head
+    return s[:head] + "\n…[%d characters trimmed by fm_tool_proxy]…\n" % (len(s) - keep) + s[-tail:]
+
+def prepare_context(req, cwd=None, budget=None):
+    """Fix 9. Returns list of changes. Mutates req."""
+    ch = []
+    msgs = req.get("messages") or []
+    facts = {}
+    for m in msgs:   # real turn-context blocks (Goose sends them when its context limit is >= 32k)
+        if m.get("role") == "user" and isinstance(m.get("content"), str) and TC_BLOCK.search(m["content"]):
+            for blk in TC_BLOCK.findall(m["content"]):
+                for k in ("working-directory", "current-time"):
+                    v = _tag(k, blk)
+                    if v: facts[k] = v
+            m["content"] = TC_BLOCK.sub("", m["content"]).strip()
+            ch.append("turn-context block moved to system line")
+    before = len(msgs)
+    msgs[:] = [m for m in msgs if not (m.get("role") == "user" and m.get("content") == "")]
+    if len(msgs) != before: ch.append("dropped %d empty turn-context messages" % (before - len(msgs)))
+    for m in msgs:
+        if m.get("role") == "system" and isinstance(m.get("content"), str):
+            s = m["content"]
+            for rx in _BOILER: s = rx.sub("", s)
+            s = re.sub(r"\n{3,}", "\n\n", s).strip()
+            if s != m["content"]: m["content"] = s; ch.append("system prompt compacted")
+    wd = facts.get("working-directory") or cwd
+    lines = []
+    if wd: lines.append("Working directory: %s (shell commands run here; use relative paths, or absolute paths the user gives)." % wd)
+    lines.append("Current time: %s." % (facts.get("current-time") or time.strftime("%Y-%m-%d %H:%M %Z")))
+    if req.get("tools"):
+        lines.append("To use a tool, call it. Never write a tool's output yourself; wait for the real result.")
+    note = {"role": "system", "content": "\n".join(lines)}
+    first_sys = next((i for i, m in enumerate(msgs) if m.get("role") == "system"), None)
+    if first_sys is None: msgs.insert(0, note)
+    else: msgs[first_sys]["content"] = note["content"] + "\n\n" + msgs[first_sys]["content"]
+    ch.append("context line: cwd=%s" % ("turn-context" if facts.get("working-directory") else "peer" if cwd else "unknown"))
+    # fit the window
+    budget = budget or (CTX - RESERVE)
+    if est_tokens(req) > budget:
+        last_user = max([i for i, m in enumerate(msgs) if m.get("role") == "user"] or [0])
+        sys_msgs = [m for m in msgs[:last_user] if m.get("role") == "system"]
+        hist = [m for m in msgs[:last_user] if m.get("role") != "system"]
+        tail = msgs[last_user:]
+        dropped = 0
+        while hist and est_tokens({**req, "messages": sys_msgs + hist + tail}) > budget:
+            nxt = next((i for i, m in enumerate(hist[1:], 1) if m.get("role") == "user"), len(hist))
+            dropped += nxt; hist = hist[nxt:]
+        if dropped:
+            ch.append("dropped %d old messages to fit %d tokens" % (dropped, budget))
+            sys_msgs[0:1] = [{**sys_msgs[0], "content": sys_msgs[0]["content"] + "\n(Earlier conversation omitted to fit the context window.)"}] if sys_msgs else []
+        msgs[:] = sys_msgs + hist + tail
+        for keep in (1500, 700, 300):
+            if est_tokens(req) <= budget: break
+            for m in msgs:
+                if m.get("role") == "tool" and isinstance(m.get("content"), str) and len(m["content"]) > keep:
+                    m["content"] = _trim_text(m["content"], keep); ch.append("tool output trimmed to %d chars" % keep)
+    req["messages"] = msgs
+    return ch
+
+# ---- reply cleanup (fix 10) ----------------------------------------------------------
+_INFO = re.compile(r"<(current-time|working-directory|turn-budget)>.*?</\1>\s*", re.S)
+_WRAP = re.compile(r"</?turn[-_]context[^>]*>\s*")
+_FAKE_OUT = re.compile(r"<(stdout|stderr|output|tool_output|tool_result|tool_response|result)>.*?(?:</\1>|\Z)\s*", re.S)
+_TAGGED = re.compile(r"<tool_call(\s[^>]*)?>(.*?)(?:</tool_call>|(?=<tool_call[\s>])|\Z)", re.S)
+_FENCE = re.compile(r"```(bash|sh|shell|zsh|console|terminal)?[ \t]*\n(.*?)```", re.S)
+
+def _clean_nul(s):
+    return re.sub(r"\n{3,}", "\n\n", s.replace("\x00", "")).strip()
+
+def _single_param(tool):
+    ps = ((tool or {}).get("function") or {}).get("parameters") or {}
+    req = ps.get("required") or []
+    if len(req) == 1: return req[0]
+    props = list((ps.get("properties") or {}).keys())
+    return props[0] if len(props) == 1 else None
+
+def clean_reply(text, tools, last_role="user"):
+    """Returns (calls, content). calls = [(name, args)]."""
+    names = [t["function"]["name"] for t in tools or []]
+    by_name = {t["function"]["name"]: t for t in tools or []}
+    t = MARKERS.sub("", text or "")
+    t = _INFO.sub("", t); t = _WRAP.sub("", t)
+    had_fake = bool(_FAKE_OUT.search(t))
+    t = _FAKE_OUT.sub("\n\x00\n", t).strip()   # \x00 marks where an invented result was
+    if not names: return [], _clean_nul(t)
+    m = _TAGGED.search(t)
+    if m:
+        attrs, body = m.group(1) or "", m.group(2)
+        if not m.group(0).rstrip().endswith("</tool_call>"):   # unclosed: the call ends at the invented result or a blank line
+            body = re.split(r"\x00|\n[ \t]*\n", body.strip(), maxsplit=1)[0]
+        body = body.replace("\x00", "").strip()
+        an = re.search(r'name\s*=\s*"([^"]+)"', attrs) or re.search(r'id\s*=\s*"([A-Za-z_][\w.\-]*?)(?:[:_]\d+)?"', attrs)
+        calls, _ = extract_tool_calls(body, names) if "{" in body else ([], "")
+        if not calls and an:
+            n = _norm_call({"name": an.group(1), "arguments": {}}, names)
+            if n:
+                name = n[0]
+                try: args = json.loads(body) if body.startswith("{") else None
+                except ValueError: args = None
+                if not isinstance(args, dict):
+                    p1 = _single_param(by_name[name])
+                    args = {p1: body} if (p1 and body) else {}
+                calls = [(name, args)]
+        if calls: return calls, _clean_nul(t[:m.start()])
+    t = _clean_nul(t)
+    calls, left = extract_tool_calls(t, names)
+    if calls:
+        return calls, left
+    if "shell" in names and last_role == "user":
+        fences = _FENCE.findall(t)
+        if len(fences) == 1:
+            lang, body = fences[0]
+            body = "\n".join(l[2:] if l.startswith("$ ") else l for l in body.strip().splitlines())
+            prose = _FENCE.sub("", t).strip()
+            if body and len(body.splitlines()) <= 5 and len(prose) <= 200 and (lang or len(body.splitlines()) == 1 or had_fake):
+                p1 = _single_param(by_name["shell"]) or "command"
+                return [("shell", {p1: body})], t[:t.find("```")].strip()
+    return [], t
+
 def is_ctx_overflow(msg):
     m = (msg or "").lower()
     return "context size" in m or "exceeded the model's context" in m or "exceeds the maximum allowed context" in m
@@ -348,8 +552,18 @@ class H(BaseHTTPRequestHandler):
         if changes:
             log(kind="normalised", changes=changes[:60])
 
+        pristine = json.loads(json.dumps(req))
+        cwd = peer_cwd(self.client_address[1]) if self.client_address and self.client_address[0] in ("127.0.0.1", "::1") else None
+        ctx_changes = prepare_context(req, cwd)
+        log(kind="context", changes=ctx_changes[:20], est_tokens=est_tokens(req))
         fwd = json.dumps(req).encode()
         code, ct, body = self._upstream("POST", self.path, fwd)
+        if code >= 500 and is_ctx_overflow(body.decode("utf-8", "replace")):   # our estimate was low: retry once, tighter
+            req = pristine; req.pop("_stop", None)
+            ctx_changes = prepare_context(req, cwd, budget=int((CTX - RESERVE) * 0.7))
+            log(kind="context_retry", changes=ctx_changes[:20], est_tokens=est_tokens(req))
+            fwd = json.dumps(req).encode()
+            code, ct, body = self._upstream("POST", self.path, fwd)
         if 400 <= code < 500:   # fix 8: keep what fm serve rejected so the field can be found
             try:
                 os.makedirs(os.path.dirname(BAD_BODY), exist_ok=True)
@@ -384,8 +598,9 @@ class H(BaseHTTPRequestHandler):
             cut = min([i for i in (raw_content.find(s) for s in stops) if i >= 0], default=-1)
             if cut >= 0: raw_content = raw_content[:cut]; msg["content"] = raw_content
         parsed = []
-        if tools and not msg.get("tool_calls"):
-            parsed, left = extract_tool_calls(raw_content, names)
+        last_role = (req.get("messages") or [{}])[-1].get("role", "user")
+        if not msg.get("tool_calls"):
+            parsed, left = clean_reply(raw_content, tools, last_role)
             msg["content"] = left if left else (None if parsed else "")
             if parsed:
                 msg["tool_calls"] = [{"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
@@ -450,6 +665,40 @@ if __name__ == "__main__":
         assert m[0]["role"] == "system" and m[1]["content"] == "hi" and m[2]["content"] == "" and m[3]["content"] == "ok"
         assert m[2]["tool_calls"][0]["function"]["arguments"] == '{"command": "ls"}' and "stop" not in out and out["_stop"] == ["X"]
         print("normalise: ok (%d changes)" % len(ch))
+        # reply cleanup: the replies Chris got from real fm serve + Goose 1.56 (2026-10-23)
+        T = [{"type": "function", "function": {"name": "shell", "parameters": {"type": "object",
+              "properties": {"command": {"type": "string"}, "timeout_secs": {"type": "integer"}}, "required": ["command"]}}},
+             {"type": "function", "function": {"name": "tree", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
+        c, t = clean_reply("<turn_context>\nThe current operational context indicates no explicit reference to a specific directory. "
+                           "Could you please clarify?\n</turn_context>", T)
+        assert c == [] and t.startswith("The current operational context") and "turn_context" not in t, (c, t)
+        chris3 = ('<turn_context>\nThe context does not indicate that this directory exists.\n</turn_context>\n<tool_call id="shell:1">\n'
+                  'python3 -c "import os; print(os.listdir())"\n\n<stdout>\n[\'run.sh\', \'README.md\']\n</stdout>\n'
+                  'The current working directory contains the following files:\n```\nrun.sh\nREADME.md\n```')
+        c, t = clean_reply(chris3, T)
+        assert c == [("shell", {"command": 'python3 -c "import os; print(os.listdir())"'})], c
+        assert t == "The context does not indicate that this directory exists.", t
+        assert clean_reply('<tool_call name="tree">{"path": "."}</tool_call>', T)[0] == [("tree", {"path": "."})]
+        assert clean_reply("I'll list them.\n```bash\nls -la\n```", T)[0] == [("shell", {"command": "ls -la"})]
+        assert clean_reply("I'll list them.\n```bash\nls -la\n```", T, "tool")[0] == []          # after a result: prose
+        assert clean_reply("Use `ls` to list files. In Python:\n```python\nimport os\n```", T)[0] == []
+        assert clean_reply("The weather is sunny.", T) == ([], "The weather is sunny.")
+        c, t = clean_reply("<turn-context>\n<current-time>2026-10-23 22:00:00 -05:00</current-time>\n"
+                           "<working-directory>/x</working-directory>\n</turn-context>\nThe files are a and b.", T)
+        assert c == [] and t == "The files are a and b.", t
+        # context: Goose's turn-context section removed, cwd line added, oversized history trimmed
+        sysp = ("You are a general-purpose AI agent called goose.\ngoose is being developed as an open-source software project.\n\n"
+                "# Turn Context\n\nEach turn may include a `<turn-context>` block.\n\n# Response Guidelines\n\nUse Markdown.")
+        big = {"messages": [{"role": "system", "content": sysp}] +
+               [m for i in range(30) for m in ({"role": "user", "content": "q%d " % i + "x" * 400}, {"role": "assistant", "content": "a" * 400})] +
+               [{"role": "user", "content": "<turn-context>\n<working-directory>/w d</working-directory>\n</turn-context>"},
+                {"role": "user", "content": "What files are here?"}], "tools": T}
+        ch = prepare_context(big, cwd="/peer")
+        s0 = big["messages"][0]["content"]
+        assert "Working directory: /w d" in s0 and "# Turn Context" not in s0 and "open-source" not in s0, s0
+        assert big["messages"][-1]["content"] == "What files are here?" and est_tokens(big) <= CTX - RESERVE, ch
+        assert all("turn-context" not in (m.get("content") or "") for m in big["messages"][1:])
+        print("goose context + reply cleanup: ok")
         sys.exit(0)
     print(f"fm_tool_proxy on 127.0.0.1:{PORT} -> {UP} (n_ctx={CTX})", file=sys.stderr)
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()

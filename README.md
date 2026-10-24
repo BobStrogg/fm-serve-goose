@@ -59,6 +59,29 @@ On any 4xx from fm serve it logs a field summary to `runs/proxy.jsonl` and saves
 checks both halves: Goose straight to the mock reproduces the 400, and Goose through the proxy prints hello.
 `GET :1977/proxy/version` reports the running proxy's version.
 
+### 2b. Fixed: `<turn_context>` echoes, "working directory is not defined", text tool calls [TESTED-MOCK + real Mac report]
+On a real Mac the interactive session answered "What files are in this directory?" with a `<turn_context>…</turn_context>`
+wrapper asking which directory, and later wrote `<tool_call id="shell:1">python3 -c …` with an invented `<stdout>` as
+plain text, which Goose never ran. Causes, from Goose 1.56.0 source (`crates/goose/src/agents/moim.rs`) and captured requests:
+- Goose's system prompt always has a `# Turn Context` section describing a `<turn-context>` block (time, working
+  directory, turn budget), but Goose only sends that block when the context limit is **at least 32,000**
+  (`MIN_CONTEXT_FOR_MOIM`). At `GOOSE_CONTEXT_LIMIT=4096` nothing carries the working directory, so the model doesn't
+  know it and copies the tag name into its reply.
+- fm 2.0.68 never fills `tool_calls` (§3), and the old proxy only parsed JSON-shaped leaks.
+
+`fm_tool_proxy.py` now:
+- removes that section and some Goose boilerplate from the system prompt
+- adds one plain line: `Working directory: …` (from a real `<turn-context>` block if present, else the cwd of the Goose
+  process on the other end of the loopback connection), the current time, and "call tools, don't write their output"
+- drops the oldest turns and trims long tool output to fit `FM_CTX`, and retries once, tighter, if fm still overflows
+- strips echoed `<turn_context>`/`<turn-context>` tags, drops invented `<stdout>`/`<output>` blocks and anything written
+  after a call, and turns `<tool_call …>` blocks, JSON blobs, and a lone ```` ```bash ```` block (only when `shell` is
+  offered and the user spoke last) into real `tool_calls`
+
+`./test_goose_session.sh` runs real Goose for two turns against `FM_MOCK_MODE=small`, which imitates these replies.
+**Expect** the on-device model to still be weak: it picks the wrong command or path, misses tool calls, or answers
+from guesswork, and each reply takes several seconds. The proxy can fix the format of what it says, not its judgement.
+
 ## 3. The tool-calling regression [SRC]
 - In fm 2.0.68.x (Beta 5 onward, and in the RC), `tool_choice:"auto"` **never fills `tool_calls`**, and `finish_reason` is `stop`. Spacecorps saw 0 of 54. When the model does call a tool, the call text leaks into `content`, for example
   `<start_of_turn>model\n{"tool_call": [{"name": "get_weather", "arguments": {"city": "Tokyo"}}]}`. Spacecorps saw this in 13 of 45 replies, and fm-proxy reported markers in 7–9 of 10. Other replies **invent the tool result instead**. Forced `tool_choice` returns 500 "An unsupported generation guide was used." Tool calling reportedly worked in 2.0.62.
@@ -89,9 +112,9 @@ fm-proxy measured 4096 on the RC (4045 tokens pass, ~4255 overflow). apfel repor
 - Set `GOOSE_CONTEXT_LIMIT`, because Goose otherwise defaults to 128k.
 
 ## 6. Run
-- Mock (Linux or Mac): `./run_mock_tests.sh` (size table), `./test_goose_smoke.sh` (strict regression test), `python3 fm_tool_proxy.py --selftest`
+- Mock (Linux or Mac): `./run_mock_tests.sh` (size table), `./test_goose_smoke.sh` (strict regression test), `./test_goose_session.sh` (multi-turn, small-model replies), `python3 fm_tool_proxy.py --selftest`
 - Mac: `sudo fm license` once, then `./start_mac.sh`, then the env from §1. Runtime logs (`proxy.jsonl`, `last_upstream_400.json`, `stack.out`) go to `runs/`, which git ignores.
-- Files: `mock_fm_serve.py`, `fm_tool_proxy.py` (`--selftest` runs the parser tests), `fm_sdk_server.py`, `config.example.yaml`, `start_mac.sh`, `run_mock_tests.sh`, `test_goose_smoke.sh`, `logs/` (request logs and bodies from the original mock runs), `bin/goose`.
+- Files: `mock_fm_serve.py`, `fm_tool_proxy.py` (`--selftest` runs the parser tests), `fm_sdk_server.py`, `config.example.yaml`, `start_mac.sh`, `run_mock_tests.sh`, `test_goose_smoke.sh`, `test_goose_session.sh`, `logs/` (request logs and bodies from the original mock runs), `bin/goose`.
 
 ## Sources
 - fm-proxy README + AGENTS.md (live audit, 27.0 RC, fm 2.0.68.1.402): https://github.com/gregbarbosa/fm-proxy · https://raw.githubusercontent.com/gregbarbosa/fm-proxy/main/AGENTS.md · fm CLI help: https://raw.githubusercontent.com/gregbarbosa/fm-proxy/main/docs/fm-reference.md
