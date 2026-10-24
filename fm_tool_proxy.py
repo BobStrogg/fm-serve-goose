@@ -58,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Runtime logs go to runs/ (gitignored) so a running stack never dirties the git checkout.
 LOG = os.environ.get("PROXY_LOG", os.path.join(HERE, "runs", "proxy.jsonl"))
 BAD_BODY = os.path.join(os.path.dirname(LOG), "last_upstream_400.json")
-PROXY_VERSION = "2026-10-24.2"   # reported by GET /proxy/version; setup restarts a stale proxy
+PROXY_VERSION = "2026-10-24.3"   # reported by GET /proxy/version; setup restarts a stale proxy
 TIMEOUT = float(os.environ.get("FM_TIMEOUT", "600"))
 
 MARKERS = re.compile(r"<start_of_turn>(?:model|assistant)?\s*|<end_of_turn>|<ctrl\d+>|<\|[a-z_]+\|>")
@@ -452,7 +452,92 @@ def _single_param(tool):
     props = list((ps.get("properties") or {}).keys())
     return props[0] if len(props) == 1 else None
 
-def clean_reply(text, tools, last_role="user"):
+# Function-call syntaxes small models wrap around a command: shell:run("ls"), shell.run(command="ls"),
+# shell("ls"), run_shell(command='ls'), developer__shell({"command": "ls"}), functions.shell(...).
+_CALL_SYN = re.compile(r'^\s*`?\s*(?P<chain>[A-Za-z_][\w\-]*(?:\s*(?:[:.]|::)\s*[A-Za-z_][\w\-]*)*)\s*\((?P<args>.*)\)\s*;?\s*`?\s*$', re.S)
+_SHELL_ALIASES = {"run", "exec", "execute", "bash", "sh", "zsh", "terminal", "cmd", "command", "run_shell", "shell_run",
+                  "run_command", "execute_command", "exec_command", "run_shell_command", "execute_shell", "shell_exec",
+                  "developer__shell", "default_api", "functions", "tools", "tool", "developer", "subprocess", "os", "system"}
+
+def _resolve_chain(chain, names):
+    """'shell:run' / 'developer__shell' / 'run_shell' -> a tool name that exists, else None."""
+    segs = [x for x in re.split(r"\s*(?:::|[:.])\s*", chain) if x]
+    for seg in segs:                                  # an exact tool name anywhere in the chain wins
+        n = _norm_call({"name": seg, "arguments": {}}, names)
+        if n: return n[0]
+    if "shell" in names and segs and all(x.lower() in _SHELL_ALIASES or "shell" in x.lower() for x in segs):
+        return "shell"
+    return None
+
+def _str_lit(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'`":
+        if s[0] == '"':
+            try: return json.loads(s)
+            except ValueError: pass
+        body = s[1:-1]
+        return re.sub(r"\\(['\"`\\])", r"\1", body)
+    return None
+
+def _parse_call_args(a):
+    """Inside of (...) -> ('pos', str) | ('kw', dict) | ('obj', dict) | ('none', None) | None."""
+    a = a.strip()
+    if not a: return ("none", None)
+    if a.startswith("{"):
+        try:
+            o = json.loads(a)
+            if isinstance(o, dict): return ("obj", o)
+        except ValueError:
+            o = _loose_obj(a)
+            if o: return ("obj", o)
+        return None
+    lit = _str_lit(a)
+    if lit is not None: return ("pos", lit)
+    kw = {}
+    for m in re.finditer(r'\s*([A-Za-z_]\w*)\s*[=:]\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|-?\d+(?:\.\d+)?|true|false|True|False)\s*(?:,|$)', a):
+        k, v = m.group(1), m.group(2)
+        sv = _str_lit(v)
+        if sv is not None: kw[k] = sv
+        elif v in ("true", "True"): kw[k] = True
+        elif v in ("false", "False"): kw[k] = False
+        else: kw[k] = float(v) if "." in v else int(v)
+    return ("kw", kw) if kw else None
+
+def unwrap_call(text, names, by_name):
+    """A whole string that is a function-call wrapper -> (tool, args) or None. Never guesses from prose."""
+    m = _CALL_SYN.match(text or "")
+    if not m: return None
+    name = _resolve_chain(m.group("chain"), names)
+    if not name: return None
+    pa = _parse_call_args(m.group("args"))
+    if pa is None: return None
+    kind, val = pa
+    p1 = _single_param(by_name.get(name)) or ("command" if name == "shell" else None)
+    if kind == "none": return (name, {})
+    if kind == "pos": return (name, {p1: val}) if p1 else None
+    args = val
+    if kind == "obj" and len(args) == 1:          # {"command": {"command": "ls"}} / {"arguments": {...}}
+        (k, v), = args.items()
+        if isinstance(v, dict) and (k in ("arguments", "args", "params", "parameters", "input") or k == p1): args = v
+    if p1 and p1 not in args:                      # run_shell(cmd="ls") -> command
+        alt = [k for k in ("cmd", "command", "input", "script", "code", "args") if isinstance(args.get(k), str)]
+        if len(alt) == 1 and len(args) == 1: args = {p1: args[alt[0]]}
+    return (name, args)
+
+def fix_args(name, args, names, by_name):
+    """Unwrap a wrapper left inside an argument: {"command": "shell:run(\"ls\")"} -> {"command": "ls"}."""
+    if not isinstance(args, dict): return name, {}
+    p1 = _single_param(by_name.get(name)) or ("command" if name == "shell" else None)
+    for _ in range(3):
+        v = args.get(p1) if p1 else None
+        if isinstance(v, dict): args = {**{k: x for k, x in args.items() if k != p1}, **v}; continue
+        if not isinstance(v, str): break
+        u = unwrap_call(v.strip(), names, by_name)
+        if not u or u[0] != name: break
+        args = {**{k: x for k, x in args.items() if k != p1}, **u[1]}
+    return name, args
+
+def _clean_reply_raw(text, tools, last_role="user"):
     """Returns (calls, content). calls = [(name, args)]."""
     names = [t["function"]["name"] for t in tools or []]
     by_name = {t["function"]["name"]: t for t in tools or []}
@@ -476,14 +561,24 @@ def clean_reply(text, tools, last_role="user"):
                 try: args = json.loads(body) if body.startswith("{") else None
                 except ValueError: args = None
                 if not isinstance(args, dict):
-                    p1 = _single_param(by_name[name])
-                    args = {p1: body} if (p1 and body) else {}
+                    u = unwrap_call(body, names, by_name)
+                    if u and u[0] == name: args = u[1]
+                    else:
+                        p1 = _single_param(by_name[name])
+                        args = {p1: body} if (p1 and body) else {}
                 calls = [(name, args)]
+        if not calls:
+            u = unwrap_call(body, names, by_name)
+            if u: calls = [u]
         if calls: return calls, _clean_nul(t[:m.start()])
     t = _clean_nul(t)
     calls, left = extract_tool_calls(t, names)
     if calls:
         return calls, left
+    if last_role == "user":   # a line that is exactly a call to an offered tool: shell:run("ls")
+        for i, line in enumerate(t.splitlines()):
+            u = unwrap_call(line.strip(), names, by_name) if "(" in line else None
+            if u: return [u], "\n".join(t.splitlines()[:i]).strip()
     if "shell" in names and last_role == "user":
         fences = _FENCE.findall(t)
         if len(fences) == 1:
@@ -494,6 +589,13 @@ def clean_reply(text, tools, last_role="user"):
                 p1 = _single_param(by_name["shell"]) or "command"
                 return [("shell", {p1: body})], t[:t.find("```")].strip()
     return [], t
+
+def clean_reply(text, tools, last_role="user"):
+    """Returns (calls, content). calls = [(name, args)] with wrapper syntax removed from the arguments."""
+    names = [t["function"]["name"] for t in tools or []]
+    by_name = {t["function"]["name"]: t for t in tools or []}
+    calls, content = _clean_reply_raw(text, tools, last_role)
+    return [fix_args(n, a, names, by_name) for n, a in calls], content
 
 def is_ctx_overflow(msg):
     m = (msg or "").lower()
@@ -698,6 +800,25 @@ if __name__ == "__main__":
         assert "Working directory: /w d" in s0 and "# Turn Context" not in s0 and "open-source" not in s0, s0
         assert big["messages"][-1]["content"] == "What files are here?" and est_tokens(big) <= CTX - RESERVE, ch
         assert all("turn-context" not in (m.get("content") or "") for m in big["messages"][1:])
+        # wrapper syntaxes seen from the on-device model (2026-10-23: `shell:run("ls")` ran as a literal command)
+        LS = [("shell", {"command": "ls"})]
+        for w in ['<tool_call id="shell:1">shell:run("ls")</tool_call>', '<tool_call id="shell:1">\nshell:run("ls")\n\n<stdout>x</stdout>',
+                  '<tool_call name="shell">shell.run(command="ls")</tool_call>', "<tool_call>shell('ls')</tool_call>",
+                  'I\'ll check the files.\nshell:run("ls")', 'shell("ls")', "run_shell(command='ls')", 'run_shell(cmd="ls")',
+                  'developer__shell({"command": "ls"})', 'functions.shell({"command": "ls"})', 'default_api:shell(command="ls")',
+                  '<tool_call name="shell">{"command": "shell:run(\\"ls\\")"}</tool_call>', '{"name": "shell", "arguments": {"command": {"command": "ls"}}}',
+                  "```bash\nshell:run(\"ls\")\n```", '<tool_call id="shell:1">`shell.run("ls")`</tool_call>']:
+            c, t = clean_reply(w, T)
+            assert c == LS, (w, c)
+        assert clean_reply('shell.run(command="ls -la", timeout_secs=30)', T)[0] == [("shell", {"command": "ls -la", "timeout_secs": 30})]
+        assert clean_reply('tree(path=".")', T)[0] == [("tree", {"path": "."})]
+        assert clean_reply('shell:run("echo \\"a b\\"")', T)[0] == [("shell", {"command": 'echo "a b"'})]
+        assert clean_reply('print("hello")', T)[0] == []                     # not a tool
+        assert clean_reply('In Python, call shell("ls") to list.', T)[0] == []  # prose, not a whole line
+        assert clean_reply('subprocess.run(["ls"])', T)[0] == []              # unparseable args: leave it
+        assert clean_reply('shell:run("ls")', T, "tool")[0] == []             # after a tool result: prose
+        for n, a in [clean_reply(w, T)[0][0] for w in ['<tool_call id="shell:1">shell:run("ls")</tool_call>']]:
+            assert "(" not in a["command"]
         print("goose context + reply cleanup: ok")
         sys.exit(0)
     print(f"fm_tool_proxy on 127.0.0.1:{PORT} -> {UP} (n_ctx={CTX})", file=sys.stderr)

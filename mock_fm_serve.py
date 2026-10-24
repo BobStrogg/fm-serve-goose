@@ -16,7 +16,8 @@ Modes (FM_MOCK_MODE):
                         wraps replies in an echoed <turn_context>; with no working directory in
                         the prompt it asks which directory; otherwise it writes the call as TEXT
                         (FM_MOCK_TOOLFMT: tagged = <tool_call id="shell:1">cmd + invented
-                        <stdout>, fenced = ```bash block, json = leaked {"tool_call":..};
+                        <stdout>, fenced = ```bash block, json = leaked {"tool_call":..},
+                        wrapped = shell:run("ls")-style function-call syntax (5 forms, in turn);
                         default rotates) and never sets tool_calls.
 Strict decoding (FM_MOCK_STRICT=1, the default; 0 turns it off): rejects request shapes that
 real fm serve's Swift Codable decoder rejects, with its 400 "...: The data couldn't be read
@@ -30,6 +31,7 @@ PORT = int(os.environ.get("FM_MOCK_PORT", "1976"))
 CTX = int(os.environ.get("FM_MOCK_CTX", "4096"))
 MODE = os.environ.get("FM_MOCK_MODE", "regression")
 TOOLFMT = os.environ.get("FM_MOCK_TOOLFMT", "rotate")
+_SEQ0 = int(os.environ.get("FM_MOCK_SEQ0", "0"))   # first form index for TOOLFMT=wrapped
 _n_small = [0]
 LOG = os.environ.get("FM_MOCK_LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", "mock_requests.jsonl"))
 STRICT = os.environ.get("FM_MOCK_STRICT", "1") != "0"
@@ -153,8 +155,16 @@ def small_model_reply(msgs, tools, last, user_text):
                 "Could you please clarify which directory you'd like me to list?\n</turn_context>")
     cmd = ("ls " + json.dumps(q.group(1))) if q else "ls"
     fmts = ["tagged", "fenced", "json"]
-    fmt = TOOLFMT if TOOLFMT in fmts else fmts[_n_small[0] % 3]
-    _n_small[0] += 1
+    fmt = TOOLFMT if TOOLFMT in fmts + ["wrapped"] else fmts[_n_small[0] % 3]
+    k = _n_small[0]; _n_small[0] += 1
+    if fmt == "wrapped":   # [observed on a Mac, 2026-10-23] the command wrapped in function-call syntax
+        q1 = json.dumps(cmd)
+        forms = ['I\'ll check the files in the current directory.\n<tool_call id="shell:1">\nshell:run(' + q1 + ')\n</tool_call>',
+                 '<tool_call name="shell">shell.run(command=' + q1 + ')</tool_call>',
+                 "Let me look.\nshell(" + q1 + ")",
+                 'developer__shell({"command": ' + q1 + '})',
+                 "run_shell(command=" + q1 + ")"]
+        return forms[(k + _SEQ0) % len(forms)]
     if fmt == "tagged":
         return ("<turn_context>\nLet me check.\n</turn_context>\n<tool_call id=\"shell:1\">\n" + cmd +
                 "\n\n<stdout>\n['run.sh', 'README.md']\n</stdout>\nThe directory contains run.sh and README.md.")

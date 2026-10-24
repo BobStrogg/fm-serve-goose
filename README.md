@@ -77,8 +77,14 @@ plain text, which Goose never ran. Causes, from Goose 1.56.0 source (`crates/goo
 - strips echoed `<turn_context>`/`<turn-context>` tags, drops invented `<stdout>`/`<output>` blocks and anything written
   after a call, and turns `<tool_call …>` blocks, JSON blobs, and a lone ```` ```bash ```` block (only when `shell` is
   offered and the user spoke last) into real `tool_calls`
+- unwraps function-call syntax around a command (proxy 2026-10-24.3). A real Mac session ran
+  `shell:run("ls")` as a literal shell command (`bash: syntax error near unexpected token`). Now `shell:run("ls")`,
+  `shell.run(command="ls")`, `shell("ls")`, `run_shell(cmd="ls")`, `developer__shell({"command": "ls"})` and the
+  same inside an argument all become `{"command": "ls"}`. This applies only to tools Goose offered, and only to a
+  whole line or a whole `<tool_call>` body, never to a call mentioned inside a sentence
 
-`./test_goose_session.sh` runs real Goose for two turns against `FM_MOCK_MODE=small`, which imitates these replies.
+`./test_goose_session.sh` runs real Goose for two turns against `FM_MOCK_MODE=small`, which imitates these replies
+(`FM_MOCK_TOOLFMT=tagged|fenced|json|wrapped`).
 **Expect** the on-device model to still be weak: it picks the wrong command or path, misses tool calls, or answers
 from guesswork, and each reply takes several seconds. The proxy can fix the format of what it says, not its judgement.
 
